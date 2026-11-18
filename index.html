@@ -38,7 +38,7 @@
 
 <script>
 // ---------------- CONFIGURAZIONE ----------------
-// Cervelli: Gemini (gratis, funziona anche dal telefono con il PC spento) e, se il PC è acceso, Ollama come riserva.
+// Cervelli, in ordine: Groq e Gemini (gratis, funzionano anche dal telefono con il PC spento), poi Ollama se il PC è acceso.
 const PRIMA_IL_PC = false;   // metti true per provare prima Ollama sul PC (privato, ma più lento)
 const OLLAMA_URL = "/ollama";   // passa dall'agente sul PC (funziona anche dal telefono)
 const MODELLO_LOCALE = "gemma3:1b";   // vedi la guida per sceglierne uno adatto al tuo PC
@@ -154,20 +154,64 @@ async function chiediCloud(msg = storia, opz = {}, sistema = ISTRUZIONI) {
   return null;
 }
 
-function primaConfigurazione() {          // chiede la chiave Gemini una sola volta, alla prima attivazione
-  let rifiutata = ""; try { rifiutata = localStorage.getItem("jarvis_key_no") || ""; } catch (e) {}
-  if (!CHIAVE_API && !rifiutata && !chiediChiave()) { try { localStorage.setItem("jarvis_key_no", "1"); } catch (e) {} }
+// ----- Groq (gratuito, molto veloce) -----
+const GROQ_URL = "https://api.groq.com/openai/v1";   // se il browser lo blocca, qui va l'indirizzo del tuo intermediario
+const MODELLI_GROQ = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"];   // provati in ordine
+let CHIAVE_GROQ = "";
+try { CHIAVE_GROQ = localStorage.getItem("jarvis_groq") || ""; } catch (e) {}
+
+function chiediChiaveGroq(forza = false) {
+  if (forza) { CHIAVE_GROQ = ""; try { localStorage.removeItem("jarvis_groq"); } catch (e) {} }
+  if (!CHIAVE_GROQ) {
+    const k = prompt("Chiave API di Groq (gratuita su console.groq.com/keys). Resta solo su questo dispositivo. Lascia vuoto per saltare:");
+    if (k && k.trim()) { CHIAVE_GROQ = k.trim(); try { localStorage.setItem("jarvis_groq", CHIAVE_GROQ); } catch (e) {} }
+  }
+  return !!CHIAVE_GROQ;
+}
+async function chiediGroq(msg, opz = {}, sistema = ISTRUZIONI) {
+  let ultimo = "nessuna risposta";
+  for (const modello of MODELLI_GROQ) {
+    const r = await fetch(GROQ_URL + "/chat/completions", {
+      method:"POST", headers:{ "Content-Type":"application/json", Authorization:"Bearer " + CHIAVE_GROQ },
+      body:JSON.stringify({ model:modello, max_tokens:opz.num_predict || 300, messages:[{ role:"system", content:sistema }, ...msg] })
+    });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok) { const t = (d.choices?.[0]?.message?.content || "").replace(/\*/g, "").trim(); if (t) return t; }
+    ultimo = (typeof d.error === "string" ? d.error : d.error?.message) || ("codice " + r.status);
+    if (r.status === 401) break;                       // chiave sbagliata: inutile provare l'altro modello
+    scrivi("", `Groq (${modello}): ${ultimo}`, "sys");
+  }
+  throw new Error(ultimo);
+}
+async function provaGroq() {
+  if (!CHIAVE_GROQ) { await parla("Non ho ancora una chiave Groq, signore. Dica: cambia chiave Groq."); return; }
+  impostaStato("pensa");
+  try {
+    scrivi("", "Groq ha risposto: " + await chiediGroq([{ role:"user", content:"Rispondi con una sola parola: pronto." }]), "sys");
+    await parla("Groq funziona, signore.");
+  } catch (e) {
+    scrivi("", "Groq: " + (e instanceof TypeError ? "non raggiungibile (rete o blocco del browser)" : e.message), "sys");
+    await parla("Groq non risponde, signore. Il motivo è scritto nel registro.");
+  }
+}
+
+function primaConfigurazione() {          // alla prima attivazione chiede le chiavi, una volta sola
+  const letto = k => { try { return localStorage.getItem(k) || ""; } catch (e) { return ""; } };
+  const segna = k => { try { localStorage.setItem(k, "1"); } catch (e) {} };
+  if (!CHIAVE_GROQ && !letto("jarvis_groq_no") && !chiediChiaveGroq()) segna("jarvis_groq_no");
+  if (!CHIAVE_GROQ && !CHIAVE_API && !letto("jarvis_key_no") && !chiediChiave()) segna("jarvis_key_no");
 }
 
 // Prova i cervelli disponibili in ordine; restituisce il testo o null
 async function chiediTesto(msg, opz, sistema) {
   const vie = [];
+  if (CHIAVE_GROQ) vie.push(["Groq", () => chiediGroq(msg, opz, sistema)]);
   if (CHIAVE_API) vie.push(["Gemini", () => chiediCloud(msg, opz, sistema)]);
-  if (agenteAttivo) vie.push(["PC", () => chiediLocale(msg, opz, sistema)]);
-  if (PRIMA_IL_PC) vie.reverse();
+  const pc = ["PC", () => chiediLocale(msg, opz, sistema)];
+  if (agenteAttivo) { if (PRIMA_IL_PC) vie.unshift(pc); else vie.push(pc); }
   for (const [nome, prova] of vie) {
     try { const t = await prova(); if (t) return t; }
-    catch (e) { scrivi("", nome + ": " + (e instanceof TypeError ? "non raggiungibile" : e.message), "sys"); }
+    catch (e) { scrivi("", nome + ": " + (e instanceof TypeError ? "non raggiungibile (rete o blocco del browser)" : e.message), "sys"); }
   }
   return null;
 }
@@ -182,9 +226,9 @@ async function chiediIA(domanda) {
     return testo;
   }
   storia.pop();
-  return CHIAVE_API || agenteAttivo
+  return CHIAVE_GROQ || CHIAVE_API || agenteAttivo
     ? "Signore, i miei cervelli sono molto affollati in questo momento. Riprovi tra qualche istante."
-    : "Signore, non ho una chiave Gemini e il computer non è collegato. Dica: cambia chiave.";
+    : "Signore, non ho nessuna chiave e il computer non è collegato. Dica: cambia chiave Groq.";
 }
 
 // ----- Agente: comandi che agiscono sul PC (serve agente.js acceso) -----
@@ -278,6 +322,8 @@ async function eseguiComando(c) {
   if (prossimoComando) { const f = prossimoComando; prossimoComando = null; return f(c); }
   if (/spegniti|arrivederci|buonanotte/.test(c)) { await parla("Alla prossima, signore."); fermati(); }
   else if (/cambia voce|altra voce|prossima voce/.test(c)) await cambiaVoce();
+  else if (/(prova|testa) gro[ckq]+/.test(c)) await provaGroq();
+  else if (/(chiave|cambia) gro[ckq]+/.test(c)) { chiediChiaveGroq(true); await parla(CHIAVE_GROQ ? "Chiave Groq aggiornata, signore." : "Va bene, userò gli altri cervelli."); }
   else if (/cambia chiave/.test(c)) { chiediChiave(true); await parla("Chiave Gemini aggiornata, signore."); }
   else if (/che ora|che ore/.test(c)) await parla("Sono le " + new Date().toLocaleTimeString("it-IT", { hour:"2-digit", minute:"2-digit" }));
   else if (/che giorno|data di oggi/.test(c)) await parla("Oggi è " + new Date().toLocaleDateString("it-IT", { weekday:"long", day:"numeric", month:"long", year:"numeric" }));
