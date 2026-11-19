@@ -155,7 +155,8 @@ async function chiediCloud(msg = storia, opz = {}, sistema = ISTRUZIONI) {
 }
 
 // ----- Groq (gratuito, molto veloce) -----
-const GROQ_URL = "https://api.groq.com/openai/v1";   // se il browser lo blocca, qui va l'indirizzo del tuo intermediario
+const GROQ_INTERMEDIARIO = "https://jarvis-groq.andre-abbiati2207.workers.dev";   // se il browser blocca Groq: incolla qui l'indirizzo del tuo Worker, es. "https://jarvis-groq.tuonome.workers.dev"
+const GROQ_URL = GROQ_INTERMEDIARIO || "https://api.groq.com/openai/v1";
 const MODELLI_GROQ = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"];   // provati in ordine
 let CHIAVE_GROQ = "";
 try { CHIAVE_GROQ = localStorage.getItem("jarvis_groq") || ""; } catch (e) {}
