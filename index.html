@@ -38,12 +38,10 @@
 
 <script>
 // ---------------- CONFIGURAZIONE ----------------
-// Cervelli, in ordine: Groq e Gemini (gratis, funzionano anche dal telefono con il PC spento), poi Ollama se il PC è acceso.
+// Cervello online: solo Groq (gratis, funziona anche dal telefono con il PC spento). Se il PC è acceso, Ollama fa da riserva.
 const PRIMA_IL_PC = false;   // metti true per provare prima Ollama sul PC (privato, ma più lento)
 const OLLAMA_URL = "/ollama";   // passa dall'agente sul PC (funziona anche dal telefono)
 const MODELLO_LOCALE = "gemma3:1b";   // vedi la guida per sceglierne uno adatto al tuo PC
-// Riserva opzionale: se hai già salvato una chiave Gemini, la usa solo quando Ollama non risponde.
-const MODELLI_CLOUD = ["gemini-flash-latest", "gemini-flash-lite-latest", "gemini-2.5-flash"];   // provati in ordine
 const NOME = "jarvis";
 const ISTRUZIONI =
   "Sei Jarvis, un assistente personale elegante, spiritoso e molto efficiente, come quello " +
@@ -58,22 +56,12 @@ const TELEFONO = /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);   // s
 const TESTI = { idle:"In standby", ascolto:"In ascolto", pensa:"Elaboro…", parla:"Risposta in corso" };
 
 let stato = "idle", voce = null, parlando = false, attivo = false, inAttesa = false, occupato = false, storia = [];
-let CHIAVE_API = "";
-try { CHIAVE_API = localStorage.getItem("jarvis_key") || ""; } catch (e) {}
 
 function impostaStato(s) { stato = s; etichetta.textContent = TESTI[s]; }
 function scrivi(chi, testo, classe = "") {
   const r = document.createElement("div");
   r.className = classe; r.textContent = chi ? chi + ": " + testo : testo;
   log.appendChild(r); log.scrollTop = log.scrollHeight;
-}
-function chiediChiave(forza = false) {
-  if (forza) { CHIAVE_API = ""; try { localStorage.removeItem("jarvis_key"); } catch (e) {} }
-  if (!CHIAVE_API) {
-    const k = prompt("Chiave API di Gemini (gratuita su aistudio.google.com/apikey). Resta solo su questo dispositivo:");
-    if (k && k.trim()) { CHIAVE_API = k.trim(); try { localStorage.setItem("jarvis_key", CHIAVE_API); } catch (e) {} }
-  }
-  return !!CHIAVE_API;
 }
 
 // ----- Voce -----
@@ -128,38 +116,12 @@ async function chiediLocale(msg = storia, opz = { num_ctx:2048, num_predict:200 
   return (dati.message?.content || "").replace(/<think>[\s\S]*?<\/think>/g, "").replace(/\*/g, "").trim();
 }
 
-async function chiediCloud(msg = storia, opz = {}, sistema = ISTRUZIONI) {
-  const contents = msg.map(m => ({ role:m.role === "assistant" ? "model" : "user", parts:[{ text:m.content }] }));
-  const corpo = { system_instruction:{ parts:[{ text:sistema }] }, contents };
-  if (opz.num_predict) corpo.generationConfig = { maxOutputTokens:opz.num_predict * 3 };
-  for (const modello of MODELLI_CLOUD) {
-    for (let tentativo = 0; tentativo < 2; tentativo++) {
-      try {
-        const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modello}:generateContent`, {
-          method:"POST", headers:{ "Content-Type":"application/json", "x-goog-api-key":CHIAVE_API }, body:JSON.stringify(corpo)
-        });
-        const dati = await r.json().catch(() => ({}));
-        const parti = dati.candidates?.[0]?.content?.parts;
-        if (r.ok && parti) return parti.map(p => p.text || "").join("").replace(/\*/g, "").trim();
-        if ([429, 500, 502, 503, 504].includes(r.status)) {
-          scrivi("", `Gemini (${modello}) occupato, riprovo…`, "sys");
-          await pausa(1500 * (tentativo + 1)); continue;
-        }
-        scrivi("", `Gemini (${modello}): ${dati.error?.message || r.status}`, "sys");
-        if (/api key/i.test(dati.error?.message || "")) return null;
-        break;
-      } catch (e) { await pausa(1000); }
-    }
-  }
-  return null;
-}
-
 // ----- Groq (gratuito, molto veloce) -----
 const GROQ_INTERMEDIARIO = "https://jarvis-groq.andre-abbiati2207.workers.dev";   // se il browser blocca Groq: incolla qui l'indirizzo del tuo Worker, es. "https://jarvis-groq.tuonome.workers.dev"
 const GROQ_URL = GROQ_INTERMEDIARIO || "https://api.groq.com/openai/v1";
 const MODELLI_GROQ = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"];   // provati in ordine
 let CHIAVE_GROQ = "";
-try { CHIAVE_GROQ = localStorage.getItem("jarvis_groq") || ""; } catch (e) {}
+try { CHIAVE_GROQ = localStorage.getItem("jarvis_groq") || ""; localStorage.removeItem("jarvis_key"); localStorage.removeItem("jarvis_key_no"); } catch (e) {}   // elimina la vecchia chiave Gemini
 
 function chiediChiaveGroq(forza = false) {
   if (forza) { CHIAVE_GROQ = ""; try { localStorage.removeItem("jarvis_groq"); } catch (e) {} }
@@ -200,14 +162,12 @@ function primaConfigurazione() {          // alla prima attivazione chiede le ch
   const letto = k => { try { return localStorage.getItem(k) || ""; } catch (e) { return ""; } };
   const segna = k => { try { localStorage.setItem(k, "1"); } catch (e) {} };
   if (!CHIAVE_GROQ && !letto("jarvis_groq_no") && !chiediChiaveGroq()) segna("jarvis_groq_no");
-  if (!CHIAVE_GROQ && !CHIAVE_API && !letto("jarvis_key_no") && !chiediChiave()) segna("jarvis_key_no");
 }
 
 // Prova i cervelli disponibili in ordine; restituisce il testo o null
 async function chiediTesto(msg, opz, sistema) {
   const vie = [];
   if (CHIAVE_GROQ) vie.push(["Groq", () => chiediGroq(msg, opz, sistema)]);
-  if (CHIAVE_API) vie.push(["Gemini", () => chiediCloud(msg, opz, sistema)]);
   const pc = ["PC", () => chiediLocale(msg, opz, sistema)];
   if (agenteAttivo) { if (PRIMA_IL_PC) vie.unshift(pc); else vie.push(pc); }
   for (const [nome, prova] of vie) {
@@ -227,7 +187,7 @@ async function chiediIA(domanda) {
     return testo;
   }
   storia.pop();
-  return CHIAVE_GROQ || CHIAVE_API || agenteAttivo
+  return CHIAVE_GROQ || agenteAttivo
     ? "Signore, i miei cervelli sono molto affollati in questo momento. Riprovi tra qualche istante."
     : "Signore, non ho nessuna chiave e il computer non è collegato. Dica: cambia chiave Groq.";
 }
@@ -325,7 +285,7 @@ async function eseguiComando(c) {
   else if (/cambia voce|altra voce|prossima voce/.test(c)) await cambiaVoce();
   else if (/(prova|testa) gro[ckq]+/.test(c)) await provaGroq();
   else if (/(chiave|cambia) gro[ckq]+/.test(c)) { chiediChiaveGroq(true); await parla(CHIAVE_GROQ ? "Chiave Groq aggiornata, signore." : "Va bene, userò gli altri cervelli."); }
-  else if (/cambia chiave/.test(c)) { chiediChiave(true); await parla("Chiave Gemini aggiornata, signore."); }
+  else if (/(cambia|nuova) chiave/.test(c)) { chiediChiaveGroq(true); await parla(CHIAVE_GROQ ? "Chiave Groq aggiornata, signore." : "Va bene, userò solo il cervello del computer."); }
   else if (/che ora|che ore/.test(c)) await parla("Sono le " + new Date().toLocaleTimeString("it-IT", { hour:"2-digit", minute:"2-digit" }));
   else if (/che giorno|data di oggi/.test(c)) await parla("Oggi è " + new Date().toLocaleDateString("it-IT", { weekday:"long", day:"numeric", month:"long", year:"numeric" }));
   else if (/(alza|aumenta).*volume|volume.*(su|alto)|più forte/.test(c)) await agisci({ azione:"volume", direzione:"su" }, "Volume alzato.");
