@@ -119,7 +119,11 @@ async function chiediLocale(msg = storia, opz = { num_ctx:2048, num_predict:200 
 // ----- Groq (gratuito, molto veloce) -----
 const GROQ_INTERMEDIARIO = "https://jarvis-groq.andre-abbiati2207.workers.dev";   // se il browser blocca Groq: incolla qui l'indirizzo del tuo Worker, es. "https://jarvis-groq.tuonome.workers.dev"
 const GROQ_URL = GROQ_INTERMEDIARIO || "https://api.groq.com/openai/v1";
-const MODELLI_GROQ = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"];   // provati in ordine
+const hostGroq = () => { try { return new URL(GROQ_URL).host; } catch (e) { return GROQ_URL; } };
+const descriviErrore = e => e instanceof TypeError ? "non raggiungibile: " + hostGroq() + " (rete, blocco del browser o permessi del Worker)" : e.message;
+// I modelli Llama sono stati ritirati da Groq ad agosto 2026: questi sono i sostituti. Se possibile, Jarvis aggiorna l'elenco da solo.
+let modelliGroq = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"];   // provati in ordine
+let modelliAggiornati = false, ultimoModelloGroq = "";
 let CHIAVE_GROQ = "";
 try { CHIAVE_GROQ = localStorage.getItem("jarvis_groq") || ""; localStorage.removeItem("jarvis_key"); localStorage.removeItem("jarvis_key_no"); } catch (e) {}   // elimina la vecchia chiave Gemini
 
@@ -131,15 +135,28 @@ function chiediChiaveGroq(forza = false) {
   }
   return !!CHIAVE_GROQ;
 }
+async function aggiornaModelliGroq() {       // chiede a Groq quali modelli esistono (serve il Worker aggiornato; altrimenti restano quelli sopra)
+  try {
+    const r = await fetch(GROQ_URL + "/models", { headers:{ Authorization:"Bearer " + CHIAVE_GROQ } });
+    if (!r.ok) return;
+    const ids = ((await r.json()).data || []).map(m => m.id).filter(id => !/whisper|tts|orpheus|guard|compound|safeguard|embed|vision|image/i.test(id));
+    const preferiti = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"].filter(id => ids.includes(id));
+    const elenco = [...preferiti, ...ids.filter(id => !preferiti.includes(id))].slice(0, 4);
+    if (elenco.length) { modelliGroq = elenco; scrivi("", "Modelli Groq disponibili: " + elenco.join(", "), "sys"); }
+  } catch (e) {}
+}
 async function chiediGroq(msg, opz = {}, sistema = ISTRUZIONI) {
   let ultimo = "nessuna risposta";
-  for (const modello of MODELLI_GROQ) {
+  if (!modelliAggiornati) { modelliAggiornati = true; await aggiornaModelliGroq(); }
+  for (const modello of modelliGroq) {
     const r = await fetch(GROQ_URL + "/chat/completions", {
       method:"POST", headers:{ "Content-Type":"application/json", Authorization:"Bearer " + CHIAVE_GROQ },
-      body:JSON.stringify({ model:modello, max_tokens:opz.num_predict || 300, messages:[{ role:"system", content:sistema }, ...msg] })
+      body:JSON.stringify({ model:modello, max_completion_tokens:(opz.num_predict || 300) * 3,   // margine per il ragionamento interno dei modelli gpt-oss
+        ...(modello.startsWith("openai/gpt-oss") ? { reasoning_effort:"low" } : {}),
+        messages:[{ role:"system", content:sistema }, ...msg] })
     });
     const d = await r.json().catch(() => ({}));
-    if (r.ok) { const t = (d.choices?.[0]?.message?.content || "").replace(/\*/g, "").trim(); if (t) return t; }
+    if (r.ok) { const t = (d.choices?.[0]?.message?.content || "").replace(/\*/g, "").trim(); if (t) { ultimoModelloGroq = modello; return t; } }
     ultimo = (typeof d.error === "string" ? d.error : d.error?.message) || ("codice " + r.status);
     if (r.status === 401) break;                       // chiave sbagliata: inutile provare l'altro modello
     scrivi("", `Groq (${modello}): ${ultimo}`, "sys");
@@ -150,10 +167,11 @@ async function provaGroq() {
   if (!CHIAVE_GROQ) { await parla("Non ho ancora una chiave Groq, signore. Dica: cambia chiave Groq."); return; }
   impostaStato("pensa");
   try {
-    scrivi("", "Groq ha risposto: " + await chiediGroq([{ role:"user", content:"Rispondi con una sola parola: pronto." }]), "sys");
+    const t = await chiediGroq([{ role:"user", content:"Rispondi con una sola parola: pronto." }]);
+    scrivi("", `Groq (${ultimoModelloGroq}) ha risposto: ${t}`, "sys");
     await parla("Groq funziona, signore.");
   } catch (e) {
-    scrivi("", "Groq: " + (e instanceof TypeError ? "non raggiungibile (rete o blocco del browser)" : e.message), "sys");
+    scrivi("", "Groq: " + descriviErrore(e), "sys");
     await parla("Groq non risponde, signore. Il motivo è scritto nel registro.");
   }
 }
@@ -172,7 +190,7 @@ async function chiediTesto(msg, opz, sistema) {
   if (agenteAttivo) { if (PRIMA_IL_PC) vie.unshift(pc); else vie.push(pc); }
   for (const [nome, prova] of vie) {
     try { const t = await prova(); if (t) return t; }
-    catch (e) { scrivi("", nome + ": " + (e instanceof TypeError ? "non raggiungibile (rete o blocco del browser)" : e.message), "sys"); }
+    catch (e) { scrivi("", nome + ": " + descriviErrore(e), "sys"); }
   }
   return null;
 }
@@ -353,6 +371,7 @@ async function avvia() {
   primaConfigurazione();
   attivo = true; btn.textContent = "Disattiva Jarvis";
   scegliVoce();
+  scrivi("", "Cervello online: Groq tramite " + hostGroq() + (CHIAVE_GROQ ? " (chiave presente)" : " (nessuna chiave)"), "sys");
   scrivi("", "Voce in uso: " + (voce ? voce.name : "predefinita") + " | Voci italiane: " + (vociItaliane().map(v => v.name).join("; ") || "nessuna"), "sys");
   fetch(OLLAMA_URL + "/api/generate", { method:"POST", body:JSON.stringify({ model:MODELLO_LOCALE, keep_alive:"30m" }) }).catch(() => {});   // carica il modello in anticipo
   await parla("Sistemi online. Sono a sua disposizione, signore.");
@@ -365,6 +384,7 @@ async function tocca() {                              // telefono: un tocco = un
   if (!attivo) {
     primaConfigurazione();
     attivo = true; scegliVoce();
+    scrivi("", "Cervello online: Groq tramite " + hostGroq() + (CHIAVE_GROQ ? " (chiave presente)" : " (nessuna chiave)"), "sys");
     scrivi("", "Voce in uso: " + (voce ? voce.name : "predefinita"), "sys");
     fetch(OLLAMA_URL + "/api/generate", { method:"POST", body:JSON.stringify({ model:MODELLO_LOCALE, keep_alive:"30m" }) }).catch(() => {});
   }
