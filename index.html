@@ -287,6 +287,32 @@ async function ricerca(argomento) {
                 : "Ho scritto la relazione ma non sono riuscito a salvarla in Word. Controlli la finestra dell'agente.");
 }
 
+// ----- Posta: avvisa a voce quando arrivano email importanti (le legge l'agente sul PC) -----
+async function controllaPosta() {
+  if (TELEFONO || !agenteAttivo || !attivo || parlando || occupato) return;   // gli avvisi li dà solo la finestra sul PC
+  const r = await agenteDati({ azione:"posta_nuove" });
+  if (!r?.nuove?.length) return;
+  occupato = true;
+  try {
+    const n = r.nuove, elenco = n.slice(0, 3).map(e => `da ${e.da}: ${e.oggetto}`).join(". ");
+    await parla(`Signore, ${n.length === 1 ? "è arrivata un'email importante" : "sono arrivate " + n.length + " email importanti"}. ${elenco}.` +
+                (n.length > 3 ? ` E altre ${n.length - 3}.` : ""));
+  } finally { occupato = false; }
+}
+setInterval(controllaPosta, 60000);
+
+async function leggiPosta() {
+  if (!agenteAttivo) { await parla("Per controllare la posta serve il computer acceso, signore."); return; }
+  const r = await agenteDati({ azione:"posta_ultime" });
+  if (!r) { await parla("Non riesco a contattare l'agente, signore."); return; }
+  if (!r.configurata) { await parla("Non ho ancora accesso a Gmail, signore. Va configurato sul computer."); return; }
+  if (r.errore) { scrivi("", "Posta: " + r.errore, "sys"); await parla("Non riesco a leggere la posta in questo momento, signore."); return; }
+  const n = r.ultime.length;
+  if (!n) { await parla("Nessuna email importante da leggere, signore."); return; }
+  await parla(`Ha ${n === 1 ? "un'email importante non letta" : n + " email importanti non lette"}. ` +
+              r.ultime.map(e => `Da ${e.da}: ${e.oggetto}`).join(". ") + ".");
+}
+
 async function apri(cosa) {
   if (/cartella/.test(cosa)) {
     for (const [re, nome] of CARTELLE) if (re.test(cosa)) return agisci({ azione:"cartella", nome }, "Apro la cartella " + nome + ".");
@@ -317,6 +343,7 @@ async function eseguiComando(c) {
     if (m) { q = m[2]; if (m[1] === "youtube") { base = "https://www.youtube.com/results?search_query="; dove = " su YouTube"; } }
     await agisci({ azione:"url", url: base + encodeURIComponent(q) }, "Cerco " + q + dove + ".");
   }
+  else if (/\b(controlla|leggi|ho|ci sono)\b.*\b(email|mail|posta)\b|\b(email|mail|posta)\b.*\b(importanti|nuove|non lette)\b/.test(c)) await leggiPosta();
   else if (/\b(ricerca|relazione|approfondimento)\b/.test(c)) {
     const m = c.match(/(?:ricerca|relazione|approfondimento)\s+(?:(?:approfondita|dettagliata|completa)\s+)?(?:sull['’]\s*|(?:su|sul|sullo|sulla|sui|sugli|sulle|riguardo(?: a| al| alla)?|riguardante|di)\s+)(.+)$/)
            || c.match(/(?:ricerca|relazione|approfondimento)\s+(?:approfondita\s+|dettagliata\s+|completa\s+)?(.+)$/);
