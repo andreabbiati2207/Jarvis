@@ -43,6 +43,9 @@ const PRIMA_IL_PC = false;   // metti true per provare prima Ollama sul PC (priv
 const OLLAMA_URL = "/ollama";   // passa dall'agente sul PC (funziona anche dal telefono)
 const MODELLO_LOCALE = "gemma3:1b";   // vedi la guida per sceglierne uno adatto al tuo PC
 const NOME = "jarvis";
+const CITTA = "Milano";            // città per il meteo (cambiala con la tua)
+const BRIEFING_AUTOMATICO = true;      // all'accensione, al mattino, Jarvis ti dà il riepilogo della giornata
+const FINESTRA_MS = 25000;   // dopo una risposta resta in ascolto per questo tempo senza bisogno di dire "Jarvis"
 const ISTRUZIONI =
   "Sei Jarvis, un assistente personale elegante, spiritoso e molto efficiente, come quello " +
   "di Tony Stark. Rispondi sempre in italiano, in massimo 3 frasi brevi, senza elenchi, " +
@@ -53,6 +56,7 @@ const ISTRUZIONI =
 const $ = id => document.getElementById(id);
 const log = $("log"), btn = $("btn"), etichetta = $("stato");
 const TELEFONO = /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);   // su telefono: tocca e parla, senza parola d'ordine
+let finestraFino = 0, ultimoParlato = "", fineParlato = 0, silenzio = false;
 const TESTI = { idle:"In standby", ascolto:"In ascolto", pensa:"Elaboro…", parla:"Risposta in corso" };
 
 let stato = "idle", voce = null, parlando = false, attivo = false, inAttesa = false, occupato = false, storia = [];
@@ -86,11 +90,12 @@ speechSynthesis.onvoiceschanged = scegliVoce; scegliVoce();
 function parla(testo) {
   return new Promise(resolve => {
     scrivi("Jarvis", testo);
+    ultimoParlato = testo;
     speechSynthesis.cancel();
     const u = new SpeechSynthesisUtterance(testo);
     u.lang = "it-IT"; u.pitch = 0.9; if (voce) u.voice = voce;
     u.onstart = () => { parlando = true; impostaStato("parla"); };
-    const fine = () => { parlando = false; impostaStato(attivo ? "ascolto" : "idle"); resolve(); };
+    const fine = () => { parlando = false; fineParlato = Date.now(); impostaStato(attivo ? "ascolto" : "idle"); resolve(); };
     u.onend = fine;
     u.onerror = e => {
       if (e.error === "not-allowed") scrivi("", "Il browser blocca la voce finché non clicchi sulla pagina: clicca una volta in un punto vuoto.", "sys");
@@ -195,6 +200,92 @@ async function chiediTesto(msg, opz, sistema) {
   return null;
 }
 
+// Parlatore a frasi: mette in coda ogni frase appena è pronta, così Jarvis comincia a parlare prima che la risposta sia finita
+function creaParlatore() {
+  let attive = 0, chiuso = false, risolvi; const finito = new Promise(r => { risolvi = r; });
+  const termina = () => { if (chiuso && attive === 0) { parlando = false; fineParlato = Date.now(); impostaStato(attivo ? "ascolto" : "idle"); risolvi(); } };
+  return {
+    aggiungi(testo) {
+      if (silenzio || !testo.trim()) return;
+      attive++;
+      const u = new SpeechSynthesisUtterance(testo);
+      u.lang = "it-IT"; u.pitch = 0.9; if (voce) u.voice = voce;
+      u.onstart = () => { parlando = true; impostaStato("parla"); };
+      u.onend = u.onerror = () => { attive--; termina(); };
+      speechSynthesis.speak(u);
+    },
+    chiudi() { chiuso = true; termina(); return finito; }
+  };
+}
+
+// Come chiediGroq, ma in streaming: chiama perFrase(frase) man mano che le frasi sono complete
+async function chiediGroqFlusso(msg, opz, sistema, perFrase) {
+  let ultimo = "nessuna risposta";
+  if (!modelliAggiornati) { modelliAggiornati = true; await aggiornaModelliGroq(); }
+  for (const modello of modelliGroq) {
+    const r = await fetch(GROQ_URL + "/chat/completions", {
+      method:"POST", headers:{ "Content-Type":"application/json", Authorization:"Bearer " + CHIAVE_GROQ },
+      body:JSON.stringify({ model:modello, stream:true, max_completion_tokens:(opz.num_predict || 300) * 3,
+        ...(modello.startsWith("openai/gpt-oss") ? { reasoning_effort:"low" } : {}),
+        messages:[{ role:"system", content:sistema }, ...msg] })
+    });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      ultimo = (typeof d.error === "string" ? d.error : d.error?.message) || ("codice " + r.status);
+      if (r.status === 401) break;
+      scrivi("", `Groq (${modello}): ${ultimo}`, "sys"); continue;
+    }
+    const lettore = r.body.getReader(), dec = new TextDecoder();
+    let buf = "", tutto = "", inCorso = "";
+    for (;;) {
+      const { done, value } = await lettore.read();
+      if (done) break;
+      buf += dec.decode(value, { stream:true });
+      let i;
+      while ((i = buf.indexOf("\n")) >= 0) {
+        const riga = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+        if (!riga.startsWith("data:") || riga.includes("[DONE]")) continue;
+        let pezzo = ""; try { pezzo = JSON.parse(riga.slice(5)).choices?.[0]?.delta?.content || ""; } catch (e) {}
+        if (!pezzo) continue;
+        tutto += pezzo; inCorso += pezzo;
+        let m;
+        while ((m = inCorso.match(/^([\s\S]{19,}?[.!?…])\s+/))) { perFrase(m[1]); inCorso = inCorso.slice(m[0].length); }
+      }
+    }
+    if (inCorso.trim()) perFrase(inCorso);
+    if (tutto.trim()) { ultimoModelloGroq = modello; return tutto; }
+  }
+  throw new Error(ultimo);
+}
+
+async function rispondi(domanda) {
+  storia.push({ role:"user", content:domanda });
+  impostaStato("pensa");
+  silenzio = false; ultimoParlato = ""; speechSynthesis.cancel();
+  const flusso = creaParlatore(); let riga = null, testo = "";
+  const dire = t => {
+    t = t.replace(/[*#`_]/g, "").trim(); if (!t) return;
+    if (!riga) { riga = document.createElement("div"); riga.textContent = "Jarvis:"; log.appendChild(riga); }
+    riga.textContent += " " + t; log.scrollTop = log.scrollHeight;
+    ultimoParlato += " " + t; flusso.aggiungi(t);
+  };
+  if (CHIAVE_GROQ) {
+    try { testo = await chiediGroqFlusso(storia, {}, sistemaConContesto(), dire); }
+    catch (e) { scrivi("", "Groq: " + descriviErrore(e), "sys"); }
+  }
+  if (!testo) {                                   // niente streaming: provo gli altri cervelli e parlo a risposta completa
+    testo = await chiediTesto(storia, undefined, sistemaConContesto()) || "";
+    if (testo) dire(testo);
+  }
+  await flusso.chiudi();
+  if (testo) { storia.push({ role:"assistant", content:testo }); if (storia.length > 10) storia = storia.slice(-10); }
+  else {
+    storia.pop();
+    await parla(CHIAVE_GROQ || agenteAttivo ? "Signore, i miei cervelli sono molto affollati in questo momento. Riprovi tra qualche istante."
+                                           : "Signore, non ho nessuna chiave e il computer non è collegato. Dica: cambia chiave Groq.");
+  }
+}
+
 async function chiediIA(domanda) {
   storia.push({ role:"user", content:domanda });
   impostaStato("pensa");
@@ -213,7 +304,7 @@ async function chiediIA(domanda) {
 // ----- Agente: comandi che agiscono sul PC (serve agente.js acceso) -----
 const AGENTE_URL = "";   // stesso indirizzo della pagina
 let agenteAttivo = false;   // vero solo se la pagina è servita dal PC con l'agente acceso
-fetch("stato").then(r => r.json()).then(d => { agenteAttivo = !!d.agente; }).catch(() => {});
+const sonda = fetch("stato").then(r => r.json()).then(d => { agenteAttivo = !!d.agente; if (agenteAttivo) caricaMemoria(); }).catch(() => {});
 async function agente(dati) {
   try {
     const r = await fetch(AGENTE_URL + "/azione", { method:"POST", headers:{ "Content-Type":"application/json" }, body:JSON.stringify(dati) });
@@ -287,6 +378,145 @@ async function ricerca(argomento) {
                 : "Ho scritto la relazione ma non sono riuscito a salvarla in Word. Controlli la finestra dell'agente.");
 }
 
+// ----- Memoria: cose da ricordare su di te (salvate sul PC) -----
+let memoria = [];
+try { memoria = JSON.parse(localStorage.getItem("jarvis_memoria") || "[]"); } catch (e) {}
+function aggiornaMemoria(voci) { memoria = voci; try { localStorage.setItem("jarvis_memoria", JSON.stringify(voci)); } catch (e) {} }
+async function caricaMemoria() { const r = await agenteDati({ azione:"memoria_leggi" }); if (r?.voci) aggiornaMemoria(r.voci); }
+
+function sistemaConContesto() {          // istruzioni + data e ora attuali + ricordi
+  const ora = new Date().toLocaleString("it-IT", { weekday:"long", day:"numeric", month:"long", year:"numeric", hour:"2-digit", minute:"2-digit" });
+  const ricordi = memoria.length
+    ? "\nCose che l'utente ti ha chiesto di ricordare (usale solo quando sono pertinenti, senza elencarle):\n" + memoria.map(v => "- " + v.testo).join("\n").slice(0, 3000) : "";
+  return ISTRUZIONI + "\nData e ora attuali: " + ora + "." + ricordi;
+}
+async function dici(frasi) {             // legge una sequenza di frasi, parlando subito
+  silenzio = false; ultimoParlato = frasi.join(" ");
+  scrivi("Jarvis", frasi.join(" "));
+  const flusso = creaParlatore();
+  frasi.forEach(f => flusso.aggiungi(f));
+  await flusso.chiudi();
+}
+async function ricorda(fatto) {
+  if (!agenteAttivo) { await parla("Posso ricordarlo solo con il computer acceso, signore."); return; }
+  const r = await agenteDati({ azione:"memoria_aggiungi", testo:fatto });
+  if (r?.voci) { aggiornaMemoria(r.voci); await parla("Annotato, signore."); }
+  else await parla("Non sono riuscito a salvarlo, signore.");
+}
+async function elencaMemoria() {
+  if (!memoria.length) { await parla("Non ricordo ancora nulla di particolare su di lei, signore."); return; }
+  await dici([`Ricordo ${memoria.length === 1 ? "una cosa" : memoria.length + " cose"}.`, ...memoria.slice(0, 8).map(v => v.testo + ".")]);
+}
+async function confermaSvuota(c) {
+  if (/^(sì|si|certo|confermo|esatto|vai|procedi)(?![a-zàèéìòù])/.test(c)) {
+    const r = await agenteDati({ azione:"memoria_svuota" });
+    if (r) { aggiornaMemoria([]); await parla("Ho dimenticato tutto, signore."); } else await parla("Non sono riuscito a farlo, signore.");
+  } else await parla("Va bene, non cancello nulla.");
+}
+async function dimentica(cosa) {
+  if (!agenteAttivo) { await parla("Posso modificare i ricordi solo con il computer acceso, signore."); return; }
+  if (/^(tutto|ogni cosa|la memoria|tutta la memoria)$/.test(cosa)) {
+    prossimoComando = confermaSvuota; inAttesa = true;
+    await parla("Vuole che dimentichi tutto, signore? Dica sì per confermare."); return;
+  }
+  const chiavi = cosa.split(/\s+/).filter(p => p.length > 3);
+  const trovati = chiavi.length ? memoria.filter(v => chiavi.every(k => v.testo.toLowerCase().includes(k))) : [];
+  if (!trovati.length) { await parla("Non trovo nulla su questo, signore."); return; }
+  if (trovati.length > 1) { await parla(`Ho trovato ${trovati.length} ricordi che corrispondono. Sia più preciso, signore.`); return; }
+  const r = await agenteDati({ azione:"memoria_elimina", ids:[trovati[0].id] });
+  if (r?.voci) { aggiornaMemoria(r.voci); await parla("Fatto, l'ho dimenticato."); } else await parla("Non sono riuscito a farlo, signore.");
+}
+
+// ----- Meteo (Open-Meteo, gratuito e senza chiave) -----
+const CODICI_METEO = { 0:"sereno", 1:"prevalentemente sereno", 2:"parzialmente nuvoloso", 3:"coperto", 45:"nebbia", 48:"nebbia con brina",
+  51:"pioviggine leggera", 53:"pioviggine", 55:"pioviggine intensa", 56:"pioviggine gelata", 57:"pioviggine gelata", 61:"pioggia debole", 63:"pioggia", 65:"pioggia forte",
+  66:"pioggia gelata", 67:"pioggia gelata", 71:"neve debole", 73:"neve", 75:"neve forte", 77:"nevischio", 80:"rovesci deboli", 81:"rovesci", 82:"rovesci violenti",
+  85:"rovesci di neve", 86:"forti rovesci di neve", 95:"temporale", 96:"temporale con grandine", 99:"forte temporale con grandine" };
+const descMeteo = c => CODICI_METEO[c] || "variabile";
+async function luogo(nome) {
+  const chiave = "jarvis_luogo_" + nome.toLowerCase();
+  try { const salvato = JSON.parse(localStorage.getItem(chiave) || "null"); if (salvato) return salvato; } catch (e) {}
+  const r = await fetch("https://geocoding-api.open-meteo.com/v1/search?name=" + encodeURIComponent(nome) + "&count=5&language=it&format=json");
+  const d = await r.json();
+  const t = (d.results || []).find(x => x.country_code === "IT") || (d.results || [])[0];
+  if (!t) throw new Error("località non trovata");
+  const L = { nome:t.name, lat:t.latitude, lon:t.longitude };
+  try { localStorage.setItem(chiave, JSON.stringify(L)); } catch (e) {}
+  return L;
+}
+async function meteo(nomeCitta, giorno = 0) {
+  const L = await luogo(nomeCitta);
+  const r = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${L.lat}&longitude=${L.lon}&current=temperature_2m,weather_code&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum&timezone=auto&forecast_days=3`);
+  const d = await r.json();
+  if (!d.daily) throw new Error("risposta meteo non valida");
+  return { luogo:L.nome, adesso:d.current?.temperature_2m, codiceAdesso:d.current?.weather_code,
+           max:d.daily.temperature_2m_max[giorno], min:d.daily.temperature_2m_min[giorno], pioggia:d.daily.precipitation_sum[giorno], codice:d.daily.weather_code[giorno] };
+}
+function fraseMeteo(m, giorno, conLuogo) {
+  const n = x => Math.round(x), mm = n(m.pioggia);
+  const piove = m.pioggia >= 0.5 ? ` Sono previsti circa ${mm} ${mm === 1 ? "millimetro" : "millimetri"} di pioggia.` : "";
+  if (giorno === 0) return `${conLuogo ? "A " + m.luogo + " ci" : "Ci"} sono ${n(m.adesso)} gradi, ${descMeteo(m.codiceAdesso)}. Oggi massima ${n(m.max)}, minima ${n(m.min)}.${piove}`;
+  return `Domani${conLuogo ? " a " + m.luogo : ""}: ${descMeteo(m.codice)}, massima ${n(m.max)} gradi, minima ${n(m.min)}.${piove}`;
+}
+async function dimmiMeteo(c) {
+  const giorno = /\bdomani\b/.test(c) ? 1 : 0;
+  const resto = c.replace(/\b(domani|oggi|adesso|ora|stasera|stamattina)\b/g, "").replace(/in questo momento/g, "").trim();
+  const mc = resto.match(/\b(?:a|ad|in|su|per)\s+([a-zàèéìòù' ]+)$/);
+  const citta = mc ? mc[1].trim() : CITTA;
+  try { const m = await meteo(citta, giorno); await dici([fraseMeteo(m, giorno, !!mc)]); }
+  catch (e) { await parla(e.message === "località non trovata" ? "Non conosco quella località, signore." : "Non riesco a ottenere il meteo in questo momento, signore."); }
+}
+
+// ----- Calendario e briefing -----
+const oraLeggibile = ms => new Date(ms).toLocaleTimeString("it-IT", { hour:"numeric", minute:"2-digit" });
+const elencoEventi = ev => ev.slice(0, 6).map(e => e.tuttoGiorno ? `${e.titolo}, tutto il giorno` : `alle ${oraLeggibile(e.inizio)} ${e.titolo}`).join("; ");
+async function leggiCalendario(giorno) {
+  if (!agenteAttivo) { await parla("Per leggere il calendario serve il computer acceso, signore."); return; }
+  const r = await agenteDati({ azione:"calendario_oggi", giorno });
+  if (!r) { await parla("Non riesco a contattare l'agente, signore."); return; }
+  if (!r.configurata) { await parla("Non ho ancora accesso al suo calendario, signore. Va configurato sul computer."); return; }
+  if (r.errore) { scrivi("", "Calendario: " + r.errore, "sys"); await parla("Non riesco a leggere il calendario in questo momento, signore."); return; }
+  const ev = giorno === 0 ? r.eventi.filter(e => e.tuttoGiorno || e.fine > Date.now()) : r.eventi;
+  await dici([ev.length ? `${giorno ? "Domani" : "Oggi"} ha ${ev.length === 1 ? "un impegno" : ev.length + " impegni"}: ${elencoEventi(ev)}.`
+                        : `Non ha impegni ${giorno ? "per domani" : "per oggi"}, signore.`]);
+}
+async function controllaCalendario() {
+  if (TELEFONO || !agenteAttivo || !attivo || parlando || occupato) return;
+  const r = await agenteDati({ azione:"calendario_imminenti" });
+  if (!r?.imminenti?.length) return;
+  occupato = true;
+  try { await dici(r.imminenti.map(e => `Signore, tra ${e.minuti} minuti ha: ${e.titolo}.`)); } finally { occupato = false; }
+}
+async function briefing() {
+  await sonda;
+  const ora = new Date(), h = ora.getHours();
+  const frasi = [`${h < 13 ? "Buongiorno" : h < 18 ? "Buon pomeriggio" : "Buonasera"} signore. Oggi è ${ora.toLocaleDateString("it-IT", { weekday:"long", day:"numeric", month:"long" })}.`];
+  try { frasi.push(fraseMeteo(await meteo(CITTA, 0), 0, false)); } catch (e) { scrivi("", "Meteo: " + e.message, "sys"); }
+  if (agenteAttivo) {
+    const c = await agenteDati({ azione:"calendario_oggi", giorno:0 });
+    if (c?.configurata && !c.errore) {
+      const ev = c.eventi.filter(e => e.tuttoGiorno || e.fine > Date.now());
+      frasi.push(ev.length ? `Nel calendario ha ${ev.length === 1 ? "un impegno" : ev.length + " impegni"}: ${elencoEventi(ev)}.` : "Non ha altri impegni in calendario per oggi.");
+    } else if (c?.errore) scrivi("", "Calendario: " + c.errore, "sys");
+    const p = await agenteDati({ azione:"posta_ultime" });
+    if (p?.configurata && !p.errore) {
+      frasi.push(p.ultime.length ? `Ha ${p.ultime.length === 1 ? "un'email importante non letta" : p.ultime.length + " email importanti non lette"}: ` +
+                                   p.ultime.slice(0, 3).map(e => `da ${e.da}, ${e.oggetto}`).join("; ") + "."
+                                 : "Non ha email importanti da leggere.");
+    } else if (p?.errore) scrivi("", "Posta: " + p.errore, "sys");
+  }
+  frasi.push("Resto a sua disposizione.");
+  await dici(frasi);
+}
+async function briefingAutomatico() {      // una sola volta al giorno, al mattino, quando Jarvis si accende da solo
+  const oggi = new Date().toLocaleDateString("sv-SE");
+  let fatto = ""; try { fatto = localStorage.getItem("jarvis_briefing") || ""; } catch (e) {}
+  if (fatto === oggi || new Date().getHours() >= 13) return;
+  try { localStorage.setItem("jarvis_briefing", oggi); } catch (e) {}
+  occupato = true;
+  try { await briefing(); } finally { occupato = false; finestraFino = Date.now() + FINESTRA_MS; }
+}
+
 // ----- Posta: avvisa a voce quando arrivano email importanti (le legge l'agente sul PC) -----
 async function controllaPosta() {
   if (TELEFONO || !agenteAttivo || !attivo || parlando || occupato) return;   // gli avvisi li dà solo la finestra sul PC
@@ -299,7 +529,7 @@ async function controllaPosta() {
                 (n.length > 3 ? ` E altre ${n.length - 3}.` : ""));
   } finally { occupato = false; }
 }
-setInterval(controllaPosta, 60000);
+setInterval(async () => { await controllaPosta(); await controllaCalendario(); }, 60000);
 
 async function leggiPosta() {
   if (!agenteAttivo) { await parla("Per controllare la posta serve il computer acceso, signore."); return; }
@@ -343,6 +573,12 @@ async function eseguiComando(c) {
     if (m) { q = m[2]; if (m[1] === "youtube") { base = "https://www.youtube.com/results?search_query="; dove = " su YouTube"; } }
     await agisci({ azione:"url", url: base + encodeURIComponent(q) }, "Cerco " + q + dove + ".");
   }
+  else if (/^(ricordati|ricorda|tieni a mente|memorizza|annota|segna)\b/.test(c)) await ricorda(c.replace(/^(ricordati|ricorda|tieni a mente|memorizza|annota|segna)\s+(che\s+|di\s+)?/, ""));
+  else if (/\b(cosa|che cosa) (ricordi|sai) (di me|su di me)|cosa hai in memoria|elenca i (miei )?ricordi/.test(c)) await elencaMemoria();
+  else if (/^(dimentica|scordati|cancella dalla memoria)\b/.test(c)) await dimentica(c.replace(/^(dimentica|scordati|cancella dalla memoria)\s+(che\s+|di\s+)?/, "").trim());
+  else if (/\b(briefing|riepilogo|rassegna)\b|^aggiornami\b|^(buongiorno|buon pomeriggio|buonasera)\b|cosa (c'è|ho) in programma|che programma ho/.test(c)) await briefing();
+  else if (/\b(meteo|previsioni)\b|\bche tempo (fa|farà|c'è)\b/.test(c)) await dimmiMeteo(c);
+  else if (/\b(agenda|calendario|impegni|appuntamenti|riunioni)\b/.test(c) && !/^(apri|aprimi|avvia|lancia)\s/.test(c)) await leggiCalendario(/\bdomani\b/.test(c) ? 1 : 0);
   else if (/\b(controlla|leggi|ho|ci sono)\b.*\b(email|mail|posta)\b|\b(email|mail|posta)\b.*\b(importanti|nuove|non lette)\b/.test(c)) await leggiPosta();
   else if (/\b(ricerca|relazione|approfondimento)\b/.test(c)) {
     const m = c.match(/(?:ricerca|relazione|approfondimento)\s+(?:(?:approfondita|dettagliata|completa)\s+)?(?:sull['’]\s*|(?:su|sul|sullo|sulla|sui|sugli|sulle|riguardo(?: a| al| alla)?|riguardante|di)\s+)(.+)$/)
@@ -350,23 +586,39 @@ async function eseguiComando(c) {
     await ricerca(m ? m[1].replace(/^(questo argomento|l'argomento|argomento)\s*/, "").trim() : "");
   }
   else if (/^(apri|aprimi|avvia|lancia)\s/.test(c)) await apri(c.replace(/^(apri|aprimi|avvia|lancia)\s+/, ""));
-  else await parla(await chiediIA(c));
+  else await rispondi(c);
 }
+
+// Frase sentita subito dopo che Jarvis ha parlato, o molto simile a ciò che ha detto: è l'eco degli altoparlanti, non l'utente
+function eco(frase) {
+  if (parlando || Date.now() < fineParlato + 1200) return true;
+  const parole = frase.split(/\s+/).filter(x => x.length > 2), detto = ultimoParlato.toLowerCase();
+  return parole.length >= 3 && parole.filter(x => detto.includes(x)).length / parole.length >= 0.7;
+}
+const CONGEDI = /^(grazie|grazie mille|ok grazie|va bene così|basta così|a posto così|niente|nulla|non importa)\b/;
 
 async function gestisci(frase) {
   if (occupato) return;
-  let comando;
+  let comando, chiudiFinestra = false;
+  const inConversazione = !TELEFONO && Date.now() < finestraFino;
   if (TELEFONO) { comando = frase.replace(/^\s*jarvis[ ,.]*/, "").trim(); inAttesa = false; if (!comando) return; }
   else if (inAttesa) { comando = frase; inAttesa = false; }
-  else {
-    if (!frase.includes(NOME)) return;
+  else if (frase.includes(NOME)) {
     comando = frase.split(NOME).slice(1).join(" ").replace(/^[ ,.]+/, "").trim();
     if (!comando) { scrivi("Tu", frase, "tu"); inAttesa = true; occupato = true; await parla("Mi dica, signore."); occupato = false; return; }
   }
+  else if (inConversazione && !eco(frase)) {                         // conversazione: niente parola d'ordine
+    comando = frase.trim();
+    if (comando.split(/\s+/).length < 2 && !CONGEDI.test(comando)) return;   // ignora rumori di una parola
+  }
+  else return;
   occupato = true;
   scrivi("Tu", frase, "tu");
-  await eseguiComando(comando);
+  if (!TELEFONO && CONGEDI.test(comando)) { chiudiFinestra = true; await parla("Prego, signore."); }
+  else await eseguiComando(comando);
   occupato = false;
+  if (!TELEFONO && attivo && !chiudiFinestra) finestraFino = Date.now() + FINESTRA_MS;   // riparte il tempo di conversazione
+  if (chiudiFinestra) finestraFino = 0;
   if (attivo && !parlando) impostaStato("ascolto");
 }
 
@@ -403,10 +655,13 @@ async function avvia() {
   fetch(OLLAMA_URL + "/api/generate", { method:"POST", body:JSON.stringify({ model:MODELLO_LOCALE, keep_alive:"30m" }) }).catch(() => {});   // carica il modello in anticipo
   await parla("Sistemi online. Sono a sua disposizione, signore.");
   try { rec.start(); } catch (e) {}
+  if (location.hash === "#auto" && BRIEFING_AUTOMATICO) briefingAutomatico();   // al mattino, una volta al giorno
 }
+setInterval(() => { if (!TELEFONO && attivo && stato === "ascolto") etichetta.textContent = Date.now() < finestraFino ? "In conversazione" : "In ascolto"; }, 500);
+addEventListener("keydown", e => { if (e.key === "Escape") { silenzio = true; speechSynthesis.cancel(); } });   // Esc = zittisce Jarvis
 function fermati() { attivo = false; try { rec.stop(); } catch (e) {} btn.textContent = "Attiva Jarvis"; impostaStato("idle"); }
 async function tocca() {                              // telefono: un tocco = una frase
-  if (parlando) { speechSynthesis.cancel(); return; }  // toccando mentre parla, lo zittisci
+  if (parlando) { silenzio = true; speechSynthesis.cancel(); return; }  // toccando mentre parla, lo zittisci
   if (occupato || !rec) return;
   if (!attivo) {
     primaConfigurazione();
