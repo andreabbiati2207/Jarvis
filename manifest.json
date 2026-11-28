@@ -1,1 +1,29 @@
-{"name":"Jarvis","short_name":"Jarvis","start_url":"./","scope":"./","display":"standalone","background_color":"#04070b","theme_color":"#04070b","icons":[{"src":"icona.svg","sizes":"any","type":"image/svg+xml","purpose":"any"}]}
+{
+  "name": "Jarvis",
+  "short_name": "Jarvis",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#020b16",
+  "theme_color": "#020b16",
+  "icons": [
+    {
+      "src": "icona-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icona-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icona.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
